@@ -1,0 +1,374 @@
+//@version=5
+// © Tim Rice, 2025. All rights reserved.
+// PROPRIETARY SOFTWARE. Unauthorized copying or distribution strictly prohibited.
+// PROFITWAVE PDF-MA Supertrend Strategy [TIMRICE] - ML Approx VA
+// PROFITWAVE PDFMA ML Approx VA
+
+strategy(
+ "PROFITWAVE PDF-MA Supertrend Strategy [TIMRICE] - ML Approx VA", // VA = Volatility Adaptive
+ "PROFITWAVE PDFMA ML Approx VA",
+ overlay=true,
+ initial_capital=1000,
+ default_qty_type=strategy.percent_of_equity,
+ default_qty_value=10,
+ slippage=1,
+ commission_type=strategy.commission.percent,
+ commission_value=0.12
+ )
+
+// ---- INPUTS SECTION ----
+// ---- User-Adjustable Strategy Settings ----
+
+// --- Calculation Settings ---
+// Settings related to the core PDF-MA calculation and smoothing
+const string inputs_calc = "Calculation Settings"
+series float src = input.source(close, "Price Source", group=inputs_calc, tooltip = "Price source to use for calculations (e.g., close, open, hl2). 'Close' is generally recommended for most strategies.")
+string smoothingMethod = input.string("EMA", "Smoothing Method", options=["EMA", "SMA"], group=inputs_calc, tooltip = "Smoothing method for the PDF-MA. 'EMA' (Exponential Moving Average) reacts faster to price changes, while 'SMA' (Simple Moving Average) is smoother. For crypto, EMA might be more responsive to volatility.")
+simple int period = input.int(20, "Smoothing Period", minval=1, group=inputs_calc, tooltip = "Period for the PDF-MA and smoothing.  Higher values create smoother MA, but with more lag. Test values between 10-30 for crypto, adjust based on timeframe and desired responsiveness.")
+simple float variance = input.float(1.5, "PDF Variance", step=0.1, minval=0.1, group=inputs_calc, tooltip = "Variance for the Probability Density Function. Controls the shape of the PDF weighting. Higher variance broadens the weighting, making the MA less sensitive. Test values between 1.0-2.0 for crypto volatility.")
+simple float mean = input.float(0.0, "PDF Mean", step=0.1, minval=-1.0, maxval=1.0, group=inputs_calc, tooltip = "Mean for the Probability Density Function. Shifts the PDF weighting curve.  A value of 0.0 centers it. Slight adjustments (-0.2 to 0.2) can sometimes fine-tune the MA, but usually keep at 0.0 for crypto.")
+
+// --- Supertrend Settings ---
+// Settings for the Supertrend indicator, defining trend direction
+const string inputs_st = "Supertrend Settings"
+simple int atrPeriod = input.int(12, "ATR Period", group = inputs_st, inline = "ST", tooltip = "ATR (Average True Range) period for Supertrend calculation. ATR measures volatility. Common values are 10-14. For volatile crypto markets, 12 is a good starting point.")
+simple float factor = input.float(1.7, "Factor", group = inputs_st, inline = "ST", step = 0.01, tooltip = "Factor to multiply the ATR by in Supertrend calculation. Higher factor values make Supertrend less sensitive to price changes, requiring larger price swings to change trend. Test factors from 1.5 to 2.5 for crypto, higher values for less frequent signals.")
+
+// --- Dynamic Profit Taking Settings (Long Positions) ---
+// Settings for dynamic profit taking when in a long position
+const string inputs_pt = "Dynamic Profit Taking (Long)"
+bool useDynamicPT = input.bool(true, "Use Dynamic Profit Taking?", group = inputs_pt, tooltip = "Enable dynamic profit taking for long positions. When enabled, strategy aims to dynamically exit long positions based on profit targets and trailing stops.")
+float pt_target_percent = input.float(0.5, "Profit Target % per Scalp", step=0.1, minval=0.1, group = inputs_pt, tooltip = "Percentage profit target for each long scalp trade. Strategy will attempt to close long position when this profit % is reached from entry price. Typical crypto scalp targets are 0.3% - 1.0%, adjust to market volatility and trading style.")
+float pt_trailing_stop_percent = input.float(0.3, "Trailing Stop % Activation", step=0.1, minval=0, maxval = 100, group = inputs_pt, tooltip = "Percentage price increase from entry to activate the trailing stop. Once price moves up by this %, a trailing stop is set to lock in profits. Common activation levels for crypto are 0.2% - 0.5%.")
+int pt_rebuy_delay_bars = input.int(2, "Rebuy Delay Bars", minval=0, group = inputs_pt, tooltip = "Number of bars to wait after a profit-taking exit before considering a new long entry. Helps avoid rapid re-entries in choppy markets. Test values from 1-5 bars for crypto, higher for less frequent re-entries.")
+
+// --- Dynamic Stop Loss Settings (Short Positions) ---
+// Settings for dynamic stop loss when in a short position
+const string inputs_sl = "Dynamic Stop Loss (Short)"
+bool useDynamicSL = input.bool(true, "Use Dynamic Stop Loss?", group = inputs_sl, tooltip = "Enable dynamic stop loss for short positions. When enabled, stop loss dynamically adjusts based on ATR and negative momentum (RSI).")
+float sl_atr_multiplier = input.float(2.0, "Stop Loss ATR Multiplier", step=0.1, minval=0.1, group = inputs_sl, tooltip = "Multiplier for ATR to calculate initial stop loss distance from short entry price. Higher multiplier widens stop loss. Common range for crypto 1.5 - 3.0, adjust to volatility and risk tolerance.")
+float sl_negative_momentum_threshold = input.float(-30, "Negative Momentum (RSI) Threshold", step=1, maxval=0, group = inputs_sl, tooltip = "RSI threshold below which negative momentum is considered high. If RSI of price is below this level, stop loss may widen. Values from -20 to -40 are typical. More negative value triggers widening at stronger negative momentum.")
+float sl_momentum_adjust_factor = input.float(0.5, "Momentum SL Adjust Factor", step=0.1, minval=0, maxval = 2, group = inputs_sl, tooltip = "Factor to adjust stop loss widening based on negative momentum strength. Higher factor results in wider stop loss widening for same RSI momentum. Range 0.3 to 1.0. Adjust to control stop loss sensitivity to momentum.")
+
+// --- UI Settings ---
+// User Interface settings to control chart appearance
+const string inputs_ui = "UI Settings"
+simple bool showST = input.bool(true, "Show Supertrend on chart?", group = inputs_ui, tooltip = "Display the Supertrend line on the price chart. Useful for visual confirmation of trend direction.")
+simple bool paintCandles = input.bool(true, "Paint candles according to Trend?", group = inputs_ui, tooltip = "Color price candles based on the Supertrend direction (Long/Short). Provides visual indication of trend directly on price bars.")
+simple bool showlongshort = input.bool(true, "Show Long and Short Signals {𝕃 + 𝕊}", group =  inputs_ui, tooltip = "Display '𝕃' (Long) and '𝕊' (Short) symbols on chart when Supertrend signals occur. Marks potential entry points visually.")
+color longColor  = input.color(#33ff00, "Long Color", group = inputs_ui, inline = "Col", tooltip = "Color for bullish signals and candle painting.")
+color shortColor = input.color(#ff0000, "Short Color", group = inputs_ui, inline = "Col", tooltip = "Color for bearish signals and candle painting.")
+
+// --- Date Range for Backtesting ---
+// Settings to limit backtesting to a specific date range
+const string inputs_date = "Date Range"
+i_start_date = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Start Date", group = inputs_date, tooltip = "Start date for backtesting the strategy. Useful to test strategy performance over specific time periods. Set to past date for backtesting.")
+i_end_date = input.time(timestamp("31 Dec 2030 23:59 +0000"), "End Date", group = inputs_date, tooltip = "End date for backtesting. Set to future date to include current data in backtest, or past date to analyze specific periods.")
+
+// ---- ML Optimized Entry/Re-entry Settings ----
+// ---- Settings related to Machine Learning Approximated Entry and Re-entry Logic ----
+const string inputs_ml = "ML Optimized Entry/Re-entry (Approx)"
+bool useMLApproxEntry = input.bool(false, "Enable ML Approx. Entry/Re-entry?", group = inputs_ml, tooltip = "Master switch to enable or disable Machine Learning approximated entry and re-entry logic. Disabling this uses standard Supertrend signals for entry.")
+
+// --- SMI Settings (Sub-section of ML Approx) ---
+// Stochastic Momentum Index related settings, for ML Approx entry logic
+const string inputs_smi = "SMI Settings"
+int smiLength = input.int(20, "SMI Length", minval=5, group = inputs_smi, tooltip = "Period for Stochastic Momentum Index (SMI) calculation. SMI measures momentum relative to price range. Common values are 10-20. For crypto, 20 may help smooth out noise. Adjust based on timeframe.")
+float smi_weight = input.float(0.5, "SMI Weight in Trend Score", step=0.1, minval=0, maxval=1, group = inputs_smi, tooltip = "Weight of SMI in the overall Trend Strength Score. Controls how much SMI influences entry decisions in ML Approx logic. Higher weight = more SMI influence. Range 0 to 1, test different weights to find optimal balance.")
+
+// --- Dynamic SMI Levels Settings (Sub-section of SMI Settings) ---
+// Settings for dynamically adjusting SMI Overbought/Oversold levels
+const string inputs_smi_dyn_levels = "Dynamic SMI Levels"
+bool useDynamicSMILimits = input.bool(true, "Use Dynamic SMI Limits?", group = inputs_smi_dyn_levels, inline = "Dynamic Limits", tooltip = "Enable dynamic adjustment of SMI Overbought/Oversold levels. When enabled, OB/OS levels adapt to market volatility and momentum.")
+float smi_volatility_factor = input.float(0.5, "Volatility Factor (ATR)", step=0.1, minval=0, maxval=2, group = inputs_smi_dyn_levels, inline = "Dynamic Limits", tooltip = "Factor controlling how much market volatility (measured by ATR) influences SMI band widening/narrowing. Higher factor = wider bands in volatile markets. Range 0 to 2, adjust based on how adaptive you want SMI to be to volatility.")
+float smi_momentum_factor = input.float(0.3, "Momentum Factor (RSI of SMI)", step=0.1, minval=0, maxval=2, group = inputs_smi_dyn_levels, inline = "Dynamic Limits", tooltip = "Factor controlling how much SMI momentum (RSI of SMI) influences shifting of OB/OS levels. Higher factor = more shift based on momentum. Range 0 to 2, adjust for desired sensitivity to SMI momentum.")
+float smi_ob_os_base = input.float(40, "SMI OB/OS Base Level", step=5, minval=10, maxval=80, group = inputs_smi_dyn_levels, inline = "Dynamic Limits", tooltip = "Base Overbought/Oversold level for SMI before dynamic adjustments. This is the starting point OB/OS level that gets adjusted by volatility and momentum. Common base levels are 30-50.")
+
+// --- Trend Strength Sensitivity Settings (Sub-section of ML Approx) ---
+// Settings to fine-tune trend strength sensitivity in ML Approx entry logic
+const string inputs_trend_sens = "Trend Strength Sensitivity"
+float trend_strength_threshold = input.float(0.6, "Trend Strength Threshold", step=0.1, minval=0, maxval=1, group = inputs_trend_sens, tooltip = "Threshold for considering trend 'strong' in ML Approx entry. Higher threshold requires stronger trend for entries. Range 0 to 1, adjust to control entry sensitivity to trend strength. For crypto, 0.5-0.7 may be suitable.")
+float reentry_delay_adjust_factor = input.float(0.5, "Re-entry Delay Adjust Factor", step=0.1, minval=0, maxval=2, group = inputs_trend_sens, tooltip = "Factor to reduce re-entry delay in strong trends (ML Approx logic). Higher factor = more aggressive reduction of re-entry delay in strong trends. Range 0 to 2, adjust to control re-entry aggressiveness in trending markets.")
+float entry_threshold_adjust_factor = input.float(0.2, "Entry Threshold Adjust Factor", step=0.1, minval=0, maxval=1, group = inputs_trend_sens, tooltip = "Factor to adjust entry threshold based on trend strength (ML Approx). Higher factor = more adjustment of entry threshold based on trend strength. Range 0 to 1, adjust to fine-tune entry sensitivity to trend strength.")
+
+// ---- Volatility Adaptive Trading Settings ----
+// ---- Settings for Volatility Adaptive Trading Feature ----
+const string inputs_volatility = "Volatility Adaptive Trading"
+bool useVolatilityAdaptiveTrading = input.bool(false, "Enable Volatility Adaptive Trading?", group = inputs_volatility, tooltip = "Master switch to enable or disable Volatility Adaptive Trading. When enabled, strategy pauses entries during low volatility periods, measured by Bollinger Band Width.")
+float volatilityThreshold = input.float(0.02, "Volatility Threshold (BBW)", step=0.005, minval=0, group = inputs_volatility, tooltip = "Bollinger Band Width (BBW) threshold below which trading is paused. BBW measures market volatility. Lower value = more sensitive to volatility changes (pauses trading at lower volatility). Adjust based on market and timeframe. For crypto, start with 0.01 - 0.03 and fine-tune.") // Example threshold value - needs tuning
+
+
+// ---- FUNCTIONS & CALCULATIONS SECTION ----
+// ---- Core functions and calculations for the strategy ----
+
+// Date Range Condition - Function to check if current time is within backtesting date range
+inDateRange = time >= i_start_date and time <= i_end_date
+
+// PDF Function - Probability Density Function calculation
+pdf(x, variance, mean) =>
+    1 / (variance * math.sqrt(2 * math.pi)) * math.exp(-math.pow(x - mean, 2) / (2 * math.pow(variance, 2)))
+
+// PDF MA Function - Probability Density Function Moving Average Calculation
+pdf_ma(src, period, variance, mean, method) =>
+    step = math.pi / (period - 1)
+    coeffs = array.new_float()
+    for k = 0 to period - 1
+        x = k * step
+        weight = pdf(x, variance, mean * math.pi)
+        array.push(coeffs, weight)
+    sum_weights = array.sum(coeffs)
+    weighted_sum = 0.0
+    for i = 0 to period - 1
+        weight = array.get(coeffs, i)
+        src_value = nz(src[i])
+        weighted_sum += weight * src_value
+    weighted_avg = weighted_sum / sum_weights
+
+    ma = method == "EMA" ? ta.ema(src, period) : ta.sma(src, period)
+    out = (weighted_avg + ma) / 2
+    out
+
+pdf_ma_out = pdf_ma(src, period, variance, mean, smoothingMethod)
+
+// Supertrend Function - Supertrend Indicator Calculation
+supertrend(factor, atrPeriod, src) =>
+    atr = ta.atr(atrPeriod)
+    upperBand = src + factor * atr
+    lowerBand = src - factor * atr
+    prevLowerBand = nz(lowerBand[1])
+    prevUpperBand = nz(upperBand[1])
+
+    lowerBand := lowerBand > prevLowerBand or close[1] < prevLowerBand ? lowerBand : prevLowerBand
+    upperBand := upperBand < prevUpperBand or upperBand < prevUpperBand ? upperBand : prevUpperBand // corrected line
+    int direction = na
+    float superTrend = na
+    prevSuperTrend = superTrend[1]
+    if na(atr[1])
+        direction := 1
+    else if prevSuperTrend == prevUpperBand
+        direction := close > upperBand ? -1 : 1
+    else
+        direction := close < lowerBand ? 1 : -1
+    superTrend := direction == -1 ? lowerBand : upperBand
+    [superTrend, direction]
+
+[superTrend, direction] = supertrend(factor, atrPeriod, pdf_ma_out)
+
+SupertrendLong = ta.crossunder(direction, 0)
+SupertrendShort = ta.crossover(direction, 0)
+
+var Trend = 0
+if SupertrendLong and not SupertrendShort
+    Trend := 1
+
+if SupertrendShort
+    Trend := -1
+
+var barColour = #ffffff
+if Trend == 1
+    barColour := longColor
+if Trend == -1
+    barColour := shortColor
+
+// --- NEW FUNCTION: Calculate SMI - Stochastic Momentum Index Calculation
+calculateSMI(src, length) =>
+    fastK = ta.sma(ta.stoch(close, high, low, length), 3)
+    fastD = ta.sma(fastK, 3)
+    SMI = 100 * (fastK - fastD)
+    SMI
+
+smiValue = calculateSMI(src, smiLength)
+
+// --- NEW FUNCTION: Calculate Dynamic SMI Overbought/Oversold Levels - Dynamic SMI OB/OS levels calculation
+calculateDynamicSMILimits(smi_series, atr_series, rsi_smi_series, volatility_factor, momentum_factor, ob_os_base) =>
+    atrInfluence = volatility_factor * atr_series / ta.sma(atr_series, 20) // Normalize ATR influence
+    momentumInfluence = momentum_factor * rsi_smi_series / 100 // Normalize Momentum influence
+
+    dynamicOBLevel = ob_os_base + atrInfluence * 20 + momentumInfluence * 15 // Example adjustment logic - tune these multipliers
+    dynamicOSLevel = -ob_os_base - atrInfluence * 20 - momentumInfluence * 15 // Example adjustment logic - tune these multipliers
+
+    [dynamicOBLevel, dynamicOSLevel]
+
+
+rsiSMI = ta.rsi(smiValue, 10) // RSI of SMI to measure SMI momentum
+atrValue = ta.atr(atrPeriod) // Calculate ATR unconditionally - moved here to resolve warning
+[dynamicOBLevel, dynamicOSLevel] = calculateDynamicSMILimits(smiValue, atrValue, rsiSMI, smi_volatility_factor, smi_momentum_factor, smi_ob_os_base)
+
+
+// --- NEW FUNCTION: Calculate Trend Strength Score (Updated to include SMI) - Trend Strength Score calculation
+calculateTrendStrengthScore(pdf_ma_trend, volume_confirmation, atr_value, rsi_value, macd_histogram, ma_confluence, smi_value, dynamic_ob_level, dynamic_os_level, smi_weight) =>
+    score = 0.0
+    score := score + pdf_ma_trend * 0.1  // Example weights - tune these
+    score := score + volume_confirmation * 0.1
+    score := score - atr_value * 0.05 // Deduct for high volatility (can be adjusted)
+    score := score + rsi_value * 0.1
+    score := score + macd_histogram * 0.1
+    score := score + ma_confluence * 0.1
+    score := score + smi_value / dynamic_ob_level * smi_weight // SMI influence - normalized by dynamic OB level
+    score
+
+
+// ---- Trend Strength Calculation ----
+// ---- Calculations for assessing trend strength using various indicators ----
+pdf_ma_trend_strength = Trend // Using simple Trend direction from Supertrend for PDF-MA trend (can be refined)
+volume_confirmation_strength = 0.5 // Placeholder - Implement volume confirmation logic if needed
+ma_confluence_strength = 0.5 // Placeholder - Implement Moving Average Confluence Logic if needed
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9) // Get MACD components
+macd_histogram_strength = histLine // Use histLine as MACD histogram strength
+rsi_strength = ta.rsi(close, 14) / 100 - 0.5 // RSI normalized to -0.5 to +0.5 range
+
+
+trendStrengthScore = calculateTrendStrengthScore(
+     pdf_ma_trend_strength,
+     volume_confirmation_strength,
+     atrValue,
+     rsi_strength,
+     macd_histogram_strength,
+     ma_confluence_strength,
+     smiValue,
+     dynamicOBLevel,
+     dynamicOSLevel,
+     smi_weight
+     )
+
+// ---- Adaptive Entry/Re-entry Conditions (ML Approximation) ----
+// ---- Entry/Re-entry conditions based on Machine Learning Approximation logic ----
+mlApproxSupertrendLongEntry = useMLApproxEntry ? (SupertrendLong and trendStrengthScore >= trend_strength_threshold and smiValue < dynamicOBLevel) : SupertrendLong // Example condition - tune
+mlApproxSupertrendShortEntry = useMLApproxEntry ? (SupertrendShort and trendStrengthScore <= -trend_strength_threshold and smiValue > dynamicOSLevel) : SupertrendShort // Example condition - tune
+mlApproxReentryDelayBars = useMLApproxEntry ? math.max(0, pt_rebuy_delay_bars - math.round(trendStrengthScore * reentry_delay_adjust_factor * pt_rebuy_delay_bars)) : pt_rebuy_delay_bars // Example - reduce delay in strong trends
+
+// --- NEW FUNCTION: Calculate Bollinger Band Width - Bollinger Band Width Calculation for Volatility Adaptive Trading
+calculateBBW(src, length, mult) =>
+    basis = ta.sma(src, length)
+    dev = mult * ta.stdev(src, length)
+    upperBB = basis + dev
+    lowerBB = basis - dev
+    bbw = upperBB - lowerBB
+    bbwValue = bbw
+
+bbwValue = calculateBBW(src, 20, 2.0) // Example BB calculation: 20 period, 2 std.dev multiplier
+isHighVolatility = not useVolatilityAdaptiveTrading or bbwValue > volatilityThreshold // Volatility condition
+
+
+// ---- GLOBAL ALERT CONDITION VARIABLES ----
+// ---- Global boolean variables to trigger alert conditions in global scope ----
+bool bullAlertCondition = false
+bool bearAlertCondition = false
+
+
+// ---- DYNAMIC PROFIT TAKING LOGIC (LONG POSITIONS) SECTION ----
+// ---- Strategy logic for entering and managing long positions with dynamic profit taking ----
+var float longEntryPrice = na
+var float longProfitTarget = na
+var float longTrailingStop = na
+var int   barsSinceLongEntry = 0
+var int   barsSinceProfitTaken = 0
+
+if (inDateRange and isHighVolatility) // Volatility Adaptive Trading check added here
+    if mlApproxSupertrendLongEntry and strategy.position_size == 0 and barsSinceProfitTaken >= mlApproxReentryDelayBars
+        strategy.entry("Long", strategy.long, comment="Long Entry") // Added comment for clarity
+        bullAlertCondition := true // Set BULL alert to true when long entry conditions are met
+        longEntryPrice := close
+        longProfitTarget := na  // Reset PT
+        longTrailingStop := na  // Reset TS
+        barsSinceLongEntry := 0
+        barsSinceProfitTaken := 0
+    barsSinceLongEntry += 1
+else
+    bullAlertCondition := false // Reset BULL alert if entry conditions are not met
+
+if strategy.position_size > 0
+    if useDynamicPT
+        // Calculate Initial Profit Target (if not already set)
+        if na(longProfitTarget)
+            longProfitTarget := longEntryPrice * (1 + pt_target_percent / 100)
+
+        // Trailing Stop Logic
+        if close >= longEntryPrice * (1 + pt_trailing_stop_percent / 100)  // Price moved up enough to activate trailing stop
+            longTrailingStop := math.max(longTrailingStop, longEntryPrice * (1 + pt_trailing_stop_percent / 100) ) // Initialize or raise trailing stop
+            longTrailingStop := math.max(longTrailingStop, close * (1 - (pt_trailing_stop_percent/2) / 100)) // Adjust trailing stop to lock profit more aggressively as price rises
+
+        // Check for Profit Target or Trailing Stop Hit
+        if close >= longProfitTarget or (not na(longTrailingStop) and close <= longTrailingStop)
+            strategy.close("Long", comment="PT/TS Long")
+            barsSinceProfitTaken := 0 // Reset rebuy delay counter
+            longProfitTarget := na    // Reset profit target for next entry
+            longTrailingStop := na     // Reset trailing stop
+
+    if SupertrendShort  // Basic Exit on Opposite Signal (can be combined with PT/SL if desired)
+        strategy.close("Long", comment="ST Short Exit")
+        longProfitTarget := na        // Reset on exit
+        longTrailingStop := na         // Reset on exit
+
+barsSinceProfitTaken += 1 // Increment rebuy delay counter
+
+
+// ---- DYNAMIC STOP LOSS LOGIC (SHORT POSITIONS) SECTION ----
+// ---- Strategy logic for entering and managing short positions with dynamic stop loss ----
+var float shortEntryPrice = na
+var float shortStopLoss = na
+var int   barsSinceShortEntry = 0
+
+rsiValue = ta.rsi(close, 14) // RSI for negative momentum
+
+if (inDateRange and isHighVolatility) // Volatility Adaptive Trading check added here
+    if mlApproxSupertrendShortEntry and strategy.position_size == 0
+        strategy.entry("Short", strategy.short, comment="Short Entry") // Added comment for clarity
+        bearAlertCondition := true // Set BEAR alert to true when short entry conditions are met
+        shortEntryPrice := close
+        shortStopLoss := na // Reset SL
+        barsSinceShortEntry := 0
+    barsSinceShortEntry += 1
+else
+    bearAlertCondition := false // Reset BEAR alert if entry conditions are not met
+
+if strategy.position_size < 0
+    if useDynamicSL
+        // Dynamic Stop Loss Calculation
+        // atrValue = ta.atr(atrPeriod) // ATR is calculated unconditionally now
+        dynamicSLFactor = sl_atr_multiplier
+
+        // Adjust SL based on Negative Momentum (RSI)
+        if rsiValue <= sl_negative_momentum_threshold
+            dynamicSLFactor := dynamicSLFactor + sl_momentum_adjust_factor * math.abs(rsiValue - sl_negative_momentum_threshold) / 100 // Wider SL in high negative momentum
+
+        shortStopLoss := shortEntryPrice + dynamicSLFactor * atrValue
+
+        // Stop Loss Condition
+        if close >= shortStopLoss
+            strategy.close("Short", comment="Dynamic SL Short")
+
+    if SupertrendLong // Basic Exit on Opposite Signal (can be combined with PT/SL if desired)
+        strategy.close("Short", comment="ST Long Exit")
+        shortStopLoss := na // Reset SL on exit
+
+
+// ---- PLOTTING SECTION ----
+// ---- Visual elements plotted on the chart for strategy analysis ----
+plot(showST ? superTrend : na, "PDFMA ST", color = color.new(barColour, 40), linewidth = 4)
+barcolor(paintCandles ? barColour : na)
+
+// Long and Short Signals (𝕃𝕊) - Plots
+plotshape(showlongshort ? SupertrendLong : na, offset=0, title="Long", text="𝕃", style=shape.triangleup, location=location.belowbar, color=barColour, textcolor=barColour,      size = size.tiny)
+plotshape(showlongshort ? SupertrendShort: na, offset=0, title="Short", text="𝕊", style=shape.triangledown, location=location.abovebar, color=barColour, textcolor=barColour,      size = size.tiny)
+
+// Plot Dynamic PT/SL Levels for Visual Confirmation (optional)
+plot(useDynamicPT and strategy.position_size > 0 ? longProfitTarget : na, color=color.green, style=plot.style_line, linewidth=1, title="Dynamic PT Long")
+plot(useDynamicPT and strategy.position_size > 0 and not na(longTrailingStop) ? longTrailingStop : na, color=color.teal, style=plot.style_line, linewidth=1, title="Trailing Stop Long")
+plot(useDynamicSL and strategy.position_size < 0 ? shortStopLoss : na, color=color.red, style=plot.style_line, linewidth=1, title="Dynamic SL Short")
+plot(useMLApproxEntry ? dynamicOBLevel : na, color=color.purple, style=plot.style_line, linewidth=1, title="Dynamic SMI OB Level")
+plot(useMLApproxEntry ? dynamicOSLevel : na, color=color.purple, style=plot.style_line, linewidth=1, title="Dynamic SMI OS Level")
+plot(useVolatilityAdaptiveTrading ? volatilityThreshold : na, color=color.orange, style=plot.style_line, linewidth=1, title="Volatility Threshold (BBW)")
+
+
+// ---- ALERT CONDITIONS SECTION - GLOBAL SCOPE ----
+// ---- Alert conditions triggered based on global boolean variables for webhook integration ----
+alertcondition(bullAlertCondition, title = "BULL", message = "PROFITWAVE Long Entry Signal {{exchange}}:{{ticker}}") // BULL Alert - GLOBAL SCOPE
+alertcondition(bearAlertCondition, title = "BEAR", message = "PROFITWAVE Short Entry Signal {{exchange}}:{{ticker}}") // BEAR Alert - GLOBAL SCOPE
+// [Existing PT/SL Hit Alerts remain if you want them for chart visualization]
+// alertcondition(useDynamicPT and strategy.position_size > 0 and close >= longProfitTarget and isHighVolatility, title="Dynamic PT Long Hit", message="Dynamic Profit Target Long Hit {{exchange}}:{{ticker}}")
+// alertcondition(useDynamicPT and strategy.position_size > 0 and not na(longTrailingStop) and close <= longTrailingStop and isHighVolatility, title="Trailing Stop Long Hit", message="Trailing Stop Long Hit {{exchange}}:{{ticker}}")
+// alertcondition(useDynamicSL and strategy.position_size < 0 and close >= shortStopLoss and isHighVolatility, title="Dynamic SL Short Hit", message="Dynamic Stop Loss Short Hit {{exchange}}:{{ticker}}")
+
+
+// ---- END OF CODE ----
